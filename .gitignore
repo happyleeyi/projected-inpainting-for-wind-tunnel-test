@@ -1,0 +1,14 @@
+.codex/
+.agents/
+.vscode/
+__pycache__/
+*.pyc
+
+# Large local data and experiment outputs
+tpu_data/
+artifacts/
+reference/
+
+# OS files
+Thumbs.db
+Desktop.ini

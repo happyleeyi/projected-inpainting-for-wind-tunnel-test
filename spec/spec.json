@@ -1,0 +1,181 @@
+{
+  "task": {
+    "name": "TPU Tap Back-Half Inpainting",
+    "description": "Given TPU tap recordings, split each recording into 3-second windows, train a conditional generator on full windows and test by masking the back half and inpainting from front-half context + labels.",
+    "problem_type": "conditional_sequence_inpainting",
+    "input_modality": "1D multivariate time-series",
+    "window_seconds": 3.0,
+    "labels": {
+      "face_id": [1, 2, 3, 4],
+      "left_distance": "continuous numeric",
+      "bottom_distance": "continuous numeric"
+    },
+    "target": "reconstruct back half of each window from context and labels"
+  },
+  "model_family": {
+    "framework": "pytorch",
+    "name": "1D_DiT_Conditional_Diffusion",
+    "type": "conditional_denoising_diffusion_with_dit_backbone",
+    "conditioning": {
+      "context": "observed_front_half",
+      "labels": [
+        "face_id",
+        "left_distance",
+        "bottom_distance"
+      ],
+      "frontend_stats": [
+        "front_half_mean",
+        "front_half_max"
+      ]
+    },
+    "architecture": {
+      "input_shape": "[T, C]",
+      "patch_size": 16,
+      "dim": 128,
+      "depth": 8,
+      "heads": 8,
+      "mlp_ratio": 4,
+      "dropout": 0.1,
+      "time_embedding_dim": 256
+    },
+    "diffusion": {
+      "schedule": "linear_beta",
+      "num_timesteps": 1000,
+      "prediction_type": "epsilon",
+      "loss": "mse_on_noise"
+    }
+  },
+  "data": {
+    "data_root": "tpu_data",
+    "format": "matlab_mat",
+    "loader": {
+      "library": "scipy.io.loadmat",
+      "signal_key_candidates": ["signal", "data", "X", "x", "tap_signal"],
+      "label_keys": {
+        "face_id": "face_id",
+        "left_distance": "left_distance",
+        "bottom_distance": "bottom_distance"
+      }
+    },
+    "windowing": {
+      "method": "fixed_length_windows",
+      "window_seconds": 3.0,
+      "window_overlap": 0.0,
+      "per_tap_timeseries": true,
+      "drop_short_tail": true
+    },
+    "train_test_split": {
+      "type": "stratified_per_label_tuple",
+      "tuple_keys": [
+        "face_id",
+        "left_distance",
+        "bottom_distance"
+      ],
+      "train_ratio": 0.8,
+      "test_ratio": 0.2,
+      "seed": 42,
+      "shuffle": true
+    },
+    "preprocessing": {
+      "sampling_rate_hz": 1000,
+      "resample_if_needed": true,
+      "normalize": "fit_standard_scaler_on_train_and_apply_to_all",
+      "split_channels_keep": "all"
+    },
+    "front_back_split": {
+      "front_ratio": 0.5,
+      "mask_back_half": true
+    }
+  },
+  "training": {
+    "entrypoint": "train_DM.py",
+    "params_config": "params.py",
+    "parser_free": true,
+    "seed": 42,
+    "batch_size": 64,
+    "accumulation_steps": 1,
+    "epochs": 200,
+    "optimizer": {
+      "name": "AdamW",
+      "lr": 1e-4,
+      "betas": [0.9, 0.999],
+      "weight_decay": 1e-2
+    },
+    "scheduler": {
+      "name": "cosine_annealing",
+      "min_lr": 1e-6,
+      "warmup_steps": 1000
+    },
+    "clip_grad_norm": 1.0,
+    "ema": {
+      "enabled": true,
+      "decay": 0.9999
+    },
+    "logging": {
+      "log_every_n_steps": 50,
+      "eval_every_n_steps": 1000,
+      "save_checkpoint_every_n_epochs": 5,
+      "early_stopping_on": "val_mse"
+    },
+    "runtime": {
+      "mixed_precision": true,
+      "deterministic": true,
+      "num_workers": 4,
+      "pin_memory": true
+    }
+  },
+  "evaluation": {
+    "entrypoint": "test.py",
+    "parser_free": true,
+    "params_config": "params.py",
+    "test_split": "from_data_split",
+    "inpainting": {
+      "mask_fraction": 0.5,
+      "sampler": "repaint",
+      "steps": 1000,
+      "eta": 0.0,
+      "guidance": {
+        "enabled": true,
+        "scale": 1.5
+      },
+      "constraint_projection": {
+        "enabled": true,
+        "constraints": ["front_half_mean", "front_half_max"],
+        "method": "affine_projection_full_sequence_per_sample",
+        "solve_for": "scale_and_shift_coefficients",
+        "apply_to": "predicted_full_sequence_after_each_sampling_step",
+        "details": "For each sample, compute current front-half mean/max and solve a,b so that transformed sequence y=a*x+b matches observed front-half mean/max exactly; enforce front-half values to observed data after transform"
+      }
+    },
+    "metrics": {
+      "mse_back_half": {
+        "name": "MSE",
+        "on": "back_half_only",
+        "axis": "time_and_channels"
+      },
+      "fid_back_half": {
+        "name": "FID",
+        "on": "back_half_only",
+        "feature_fn": "flattened_back_half_vectors",
+        "distance": "frechet"
+      }
+    }
+  },
+  "outputs": {
+    "model_checkpoint": "outputs/checkpoints/best_model.pt",
+    "ema_checkpoint": "outputs/checkpoints/best_model_ema.pt",
+    "scalars": "outputs/metrics.jsonl",
+    "test_report": "outputs/test_metrics.json",
+    "reconstructions": {
+      "format": "npy",
+      "path": "outputs/reconstructions/back_half_repainted.npy"
+    },
+    "fid_inputs": "outputs/fid_cache/back_half_real_fake_features.npz"
+  },
+  "assumptions": {
+    "label_sources": "Each MATLAB file contains per-window metadata with face_id, left_distance, and bottom_distance values; if missing, fallback to nearest parent/filename parsing can be added.",
+    "signal_sampling_rate": "Assumed 1000 Hz unless a time vector or sampling-rate metadata key is provided in the MAT file.",
+    "channels_per_signal": "All channels in each MAT timeseries are treated as model inputs; no sensor-specific hand filtering is applied.",
+    "front_half_stats_projection": "Projection is interpreted as a hard-context projection that enforces observed front-half statistics while keeping front context visible at every reverse step."
+  }
+}
